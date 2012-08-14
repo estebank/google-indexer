@@ -1,0 +1,788 @@
+Index: grammar/Python.g
+===================================================================
+--- grammar/Python.g	(revision 6959)
++++ grammar/Python.g	(working copy)
+@@ -367,7 +367,7 @@
+         }
+       |
+         {
+-            $etype = new Name($n1, $n1.text, expr_contextType.Load);
++            $etype = actions.makeNameNode($n1);
+         }
+       )
+     ;
+@@ -783,13 +783,16 @@
+ import_from
+     : FROM (d+=DOT* dotted_name | d+=DOT+) IMPORT
+         (STAR
+-       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.name),
++       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.names),
++             actions.makeModuleNameNode($d, $dotted_name.names),
+              actions.makeStarAlias($STAR), actions.makeLevel($d)])
+         | i1=import_as_names
+-       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.name),
++       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.names),
++             actions.makeModuleNameNode($d, $dotted_name.names),
+              actions.makeAliases($i1.atypes), actions.makeLevel($d)])
+         | LPAREN i2=import_as_names COMMA? RPAREN
+-       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.name),
++       -> ^(FROM<ImportFrom>[$FROM, actions.makeFromText($d, $dotted_name.names),
++             actions.makeModuleNameNode($d, $dotted_name.names),
+              actions.makeAliases($i2.atypes), actions.makeLevel($d)])
+         )
+     ;
+@@ -811,7 +814,7 @@
+ }
+     : name=NAME (AS asname=NAME)?
+     {
+-        $atype = new alias($name, $name.text, $asname.text);
++        $atype = new alias(actions.makeNameNode($name), actions.makeNameNode($asname));
+     }
+     ;
+ 
+@@ -822,10 +825,9 @@
+ @after {
+     $dotted_as_name.tree = $atype;
+ }
+-
+-    : dotted_name (AS NAME)?
++    : dotted_name (AS asname=NAME)?
+     {
+-        $atype = new alias($NAME, $dotted_name.name, $NAME.text);
++        $atype = new alias($dotted_name.names, actions.makeNameNode($asname));
+     }
+     ;
+ 
+@@ -840,17 +842,17 @@
+ 
+ //dotted_name: NAME ('.' NAME)*
+ dotted_name
+-    returns [String name]
++    returns [List<Name> names]
+     : NAME (DOT dn+=attr)*
+     {
+-        $name = actions.makeDottedText($NAME, $dn);
++        $names = actions.makeDottedName($NAME, $dn);
+     }
+     ;
+ 
+ //global_stmt: 'global' NAME (',' NAME)*
+ global_stmt
+     : GLOBAL n+=NAME (COMMA n+=NAME)*
+-   -> ^(GLOBAL<Global>[$GLOBAL, actions.makeNames($n)])
++   -> ^(GLOBAL<Global>[$GLOBAL, actions.makeNames($n), actions.makeNameNodes($n)])
+     ;
+ 
+ //exec_stmt: 'exec' expr ['in' test [',' test]]
+@@ -1522,7 +1524,7 @@
+     | LBRACK subscriptlist[$begin] RBRACK
+    -> ^(LBRACK<Subscript>[$begin, actions.castExpr($tree), actions.castSlice($subscriptlist.tree), $expr::ctype])
+     | DOT attr
+-   -> ^(DOT<Attribute>[$begin, actions.castExpr($tree), $attr.text, $expr::ctype])
++   -> ^(DOT<Attribute>[$begin, actions.castExpr($tree), new Name($attr.tree, $attr.text, expr_contextType.Load), $expr::ctype])
+     ;
+ 
+ //subscriptlist: subscript (',' subscript)* [',']
+@@ -1630,7 +1632,7 @@
+           if ($decorators.start != null) {
+               t = $decorators.start;
+           }
+-          stype = new ClassDef(t, actions.cantBeNone($NAME),
++          stype = new ClassDef(t, actions.cantBeNoneName($NAME),
+               actions.makeBases(actions.castExpr($testlist.tree)),
+               actions.castStmts($suite.stypes),
+               actions.castExprs($decorators.etypes));
+Index: src/org/python/antlr/PythonTree.java
+===================================================================
+--- src/org/python/antlr/PythonTree.java	(revision 6959)
++++ src/org/python/antlr/PythonTree.java	(working copy)
+@@ -5,6 +5,7 @@
+ import org.antlr.runtime.tree.CommonTree;
+ 
+ import org.python.core.PyType;
++import org.python.antlr.ast.Name;
+ import org.python.antlr.ast.VisitorIF;
+ 
+ import java.util.ArrayList;
+@@ -165,6 +166,35 @@
+         node.setChildIndex(index);
+     }
+ 
++    /**
++     * Converts a list of Name to a dotted-name string.
++     * Because leading dots are indexable identifiers (referring
++     * to parent directories in relative imports), a Name list
++     * may include leading dots, but not dots between names.
++     */
++    public static String dottedNameListToString(List<Name> names) {
++        if (names == null) {
++            return "";
++        }
++        StringBuilder sb = new StringBuilder();
++        boolean leadingDot = true;
++        for (int i = 0, len = names.size(); i < len; i++) {
++            Name name = names.get(i);
++            String id = name.getInternalId();
++            if (id == null) {
++                continue;
++            }
++            if (!".".equals(id)) {
++                leadingDot = false;
++            }
++            sb.append(id);
++            if (i < len - 1 && !leadingDot) {
++                sb.append(".");
++            }
++        }
++        return sb.toString();
++    }
++
+     @Override
+     public String toString() {
+         if (isNil()) {
+Index: src/org/python/antlr/GrammarActions.java
+===================================================================
+--- src/org/python/antlr/GrammarActions.java	(revision 6959)
++++ src/org/python/antlr/GrammarActions.java	(working copy)
+@@ -61,19 +61,41 @@
+         this.errorHandler = eh;
+     }
+ 
+-    String makeFromText(List dots, String name) {
+-        StringBuffer d = new StringBuffer();
++    String makeFromText(List dots, List<Name> names) {
++        StringBuilder d = new StringBuilder();
+         if (dots != null) {
+             for (int i=0;i<dots.size();i++) {
+                 d.append(".");
+             }
+         }
+-        if (name != null) {
+-            d.append(name);
+-        }
++        d.append(PythonTree.dottedNameListToString(names));
+         return d.toString();
+     }
+ 
++    List<Name> makeModuleNameNode(List dots, List<Name> names) {
++        List<Name> result = new ArrayList<Name>();
++        if (dots != null) {
++            for (Object o : dots) {
++                Token tok = (Token)o;
++                result.add(new Name(tok, tok.getText(), expr_contextType.Load));
++            }
++        }
++        result.addAll(names);
++        return result;
++    }
++
++    List<Name> makeDottedName(Token top, List<PythonTree> attrs) {
++      List<Name> result = new ArrayList<Name>();
++      result.add(new Name(top, top.getText(), expr_contextType.Load));
++      if (attrs != null) {
++        for (PythonTree attr : attrs) {
++          Token token = attr.getToken();
++          result.add(new Name(token, token.getText(), expr_contextType.Load));
++        }
++      }
++      return result;
++    }
++
+     int makeLevel(List lev) {
+         if (lev == null) {
+             return 0;
+@@ -113,6 +135,21 @@
+         return s;
+     }
+ 
++    Name makeNameNode(Token t) {
++        if (t == null) {
++            return null;
++        }
++        return new Name(t, t.getText(), expr_contextType.Load);
++    }
++
++    List<Name> makeNameNodes(List<Token> names) {
++        List<Name> s = new ArrayList<Name>();
++        for (int i=0; i<names.size(); i++) {
++            s.add(makeNameNode(names.get(i)));
++        }
++        return s;
++    }
++
+     void errorGenExpNotSoleArg(PythonTree t) {
+         errorHandler.error("Generator expression must be parenthesized if not sole argument", t);
+     }
+@@ -191,7 +228,7 @@
+         expr current = new Name(nameToken, nameToken.getText(), expr_contextType.Load);
+         for (Object o: attrs) {
+             Token t = (Token)o;
+-            current = new Attribute(t, current, t.getText(),
++            current = new Attribute(t, current, cantBeNoneName(t),
+                 expr_contextType.Load);
+         }
+         return current;
+@@ -236,21 +273,21 @@
+         List<stmt> f = castStmts(finBody);
+         return new TryFinally(t, b, f);
+     }
+- 
++
+     stmt makeFuncdef(Token t, Token nameToken, arguments args, List funcStatements, List decorators) {
+         if (nameToken == null) {
+             return errorHandler.errorStmt(new PythonTree(t));
+         }
+-        cantBeNone(nameToken);
++        Name n = cantBeNoneName(nameToken);
+         arguments a;
+         if (args != null) {
+             a = args;
+         } else {
+-            a = new arguments(t, new ArrayList<expr>(), null, null, new ArrayList<expr>()); 
++            a = new arguments(t, new ArrayList<expr>(), (Name)null, null, new ArrayList<expr>());
+         }
+         List<stmt> s = castStmts(funcStatements);
+         List<expr> d = castExprs(decorators);
+-        return new FunctionDef(t, nameToken.getText(), a, s, d);
++        return new FunctionDef(t, n, a, s, d);
+     }
+ 
+     List<expr> makeAssignTargets(expr lhs, List rhs) {
+@@ -293,17 +330,17 @@
+ 
+         List<expr> p = castExprs(params);
+         List<expr> d = castExprs(defaults);
+-        String s;
+-        String k;
++        Name s;
++        Name k;
+         if (snameToken == null) {
+             s = null;
+         } else {
+-            s = cantBeNone(snameToken);
++            s = cantBeNoneName(snameToken);
+         }
+         if (knameToken == null) {
+             k = null;
+         } else {
+-            k = cantBeNone(knameToken);
++            k = cantBeNoneName(knameToken);
+         }
+         return new arguments(t, p, s, k, d);
+     }
+@@ -516,6 +553,13 @@
+         return t.getText();
+     }
+ 
++    Name cantBeNoneName(Token t) {
++        if (t == null || t.getText().equals("None")) {
++            errorHandler.error("can't be None", new PythonTree(t));
++        }
++        return new Name(t, t.getText(), expr_contextType.Load);
++    }
++
+     void cantBeNone(PythonTree e) {
+         if (e.getText().equals("None")) {
+             errorHandler.error("can't be None", e);
+@@ -722,18 +766,4 @@
+         }
+         return s;
+     }
+-
+-    public String makeDottedText(Token name, List<PythonTree> c) {
+-        final String dot = ".";
+-        if (c == null || c.isEmpty()) {
+-            return name.getText();
+-        }
+-        StringBuilder b = new StringBuilder(name.getText());
+-        for (PythonTree t : c) {
+-            b.append(dot);
+-            b.append(t.getToken().getText());
+-        }
+-        return b.toString();
+-    }
+-
+ }
+Index: src/org/python/antlr/ast/Attribute.java
+===================================================================
+--- src/org/python/antlr/ast/Attribute.java	(revision 6959)
++++ src/org/python/antlr/ast/Attribute.java	(working copy)
+@@ -45,6 +45,10 @@
+     public String getInternalAttr() {
+         return attr;
+     }
++    private Name attrName;
++    public Name getInternalAttrName() {
++        return attrName;
++    }
+     @ExposedGet(name = "attr")
+     public PyObject getAttr() {
+         if (attr == null) return Py.None;
+@@ -119,6 +123,24 @@
+         this.ctx = ctx;
+     }
+ 
++    public Attribute(Token token, expr value, Name attr, expr_contextType ctx) {
++        super(token);
++        this.value = value;
++        addChild(value);
++        this.attr = attr.getText();
++        this.attrName = attr;
++        this.ctx = ctx;
++    }
++
++    public Attribute(Integer ttype, Token token, expr value, Name attr, expr_contextType ctx) {
++        super(ttype, token);
++        this.value = value;
++        addChild(value);
++        this.attr = attr.getText();
++        this.attrName = attr;
++        this.ctx = ctx;
++    }
++
+     public Attribute(Integer ttype, Token token, expr value, String attr, expr_contextType ctx) {
+         super(ttype, token);
+         this.value = value;
+Index: src/org/python/antlr/ast/Global.java
+===================================================================
+--- src/org/python/antlr/ast/Global.java	(revision 6959)
++++ src/org/python/antlr/ast/Global.java	(working copy)
+@@ -40,8 +40,11 @@
+     public void setNames(PyObject names) {
+         this.names = AstAdapters.py2identifierList(names);
+     }
++    private java.util.List<Name> nameNodes;
++    public java.util.List<Name> getInternalNameNodes() {
++        return nameNodes;
++    }
+ 
+-
+     private final static PyString[] fields =
+     new PyString[] {new PyString("names")};
+     @ExposedGet(name = "_fields")
+@@ -85,6 +88,12 @@
+         this.names = names;
+     }
+ 
++    public Global(Integer ttype, Token token, java.util.List<String> names, java.util.List<Name> nameNodes) {
++        super(ttype, token);
++        this.names = names;
++        this.nameNodes = nameNodes;
++    }
++
+     public Global(Integer ttype, Token token, java.util.List<String> names) {
+         super(ttype, token);
+         this.names = names;
+Index: src/org/python/antlr/ast/arguments.java
+===================================================================
+--- src/org/python/antlr/ast/arguments.java	(revision 6959)
++++ src/org/python/antlr/ast/arguments.java	(working copy)
+@@ -45,6 +45,12 @@
+     public String getInternalVararg() {
+         return vararg;
+     }
++
++    private Name varargName;
++    public Name getInternalVarargName() {
++        return varargName;
++    }
++
+     @ExposedGet(name = "vararg")
+     public PyObject getVararg() {
+         if (vararg == null) return Py.None;
+@@ -59,6 +65,12 @@
+     public String getInternalKwarg() {
+         return kwarg;
+     }
++
++    private Name kwargName;
++    public Name getInternalKwargName() {
++        return kwargName;
++    }
++
+     @ExposedGet(name = "kwarg")
+     public PyObject getKwarg() {
+         if (kwarg == null) return Py.None;
+@@ -117,8 +129,29 @@
+         setDefaults(defaults);
+     }
+ 
+-    public arguments(Token token, java.util.List<expr> args, String vararg, String kwarg,
+-    java.util.List<expr> defaults) {
++    // public arguments(Token token, java.util.List<expr> args, String vararg, String kwarg,
++    // java.util.List<expr> defaults) {
++    //     super(token);
++    //     this.args = args;
++    //     if (args == null) {
++    //         this.args = new ArrayList<expr>();
++    //     }
++    //     for(PythonTree t : this.args) {
++    //         addChild(t);
++    //     }
++    //     this.vararg = vararg;
++    //     this.kwarg = kwarg;
++    //     this.defaults = defaults;
++    //     if (defaults == null) {
++    //         this.defaults = new ArrayList<expr>();
++    //     }
++    //     for(PythonTree t : this.defaults) {
++    //         addChild(t);
++    //     }
++    // }
++
++    public arguments(Token token, java.util.List<expr> args, Name vararg, Name kwarg,
++            java.util.List<expr> defaults) {
+         super(token);
+         this.args = args;
+         if (args == null) {
+@@ -127,8 +160,10 @@
+         for(PythonTree t : this.args) {
+             addChild(t);
+         }
+-        this.vararg = vararg;
+-        this.kwarg = kwarg;
++        this.vararg = vararg == null ? null : vararg.getText();
++        this.varargName = vararg;
++        this.kwarg = kwarg == null ? null : kwarg.getText();
++        this.kwargName = kwarg;
+         this.defaults = defaults;
+         if (defaults == null) {
+             this.defaults = new ArrayList<expr>();
+Index: src/org/python/antlr/ast/ClassDef.java
+===================================================================
+--- src/org/python/antlr/ast/ClassDef.java	(revision 6959)
++++ src/org/python/antlr/ast/ClassDef.java	(working copy)
+@@ -32,6 +32,10 @@
+     public String getInternalName() {
+         return name;
+     }
++    private Name nameNode;
++    public Name getInternalNameNode() {
++        return nameNode;
++    }
+     @ExposedGet(name = "name")
+     public PyObject getName() {
+         if (name == null) return Py.None;
+@@ -154,6 +158,34 @@
+         }
+     }
+ 
++    public ClassDef(Token token, Name name, java.util.List<expr> bases, java.util.List<stmt>
++    body, java.util.List<expr> decorator_list) {
++        super(token);
++        this.name = name.getText();
++        this.nameNode = name;
++        this.bases = bases;
++        if (bases == null) {
++            this.bases = new ArrayList<expr>();
++        }
++        for(PythonTree t : this.bases) {
++            addChild(t);
++        }
++        this.body = body;
++        if (body == null) {
++            this.body = new ArrayList<stmt>();
++        }
++        for(PythonTree t : this.body) {
++            addChild(t);
++        }
++        this.decorator_list = decorator_list;
++        if (decorator_list == null) {
++            this.decorator_list = new ArrayList<expr>();
++        }
++        for(PythonTree t : this.decorator_list) {
++            addChild(t);
++        }
++    }
++
+     public ClassDef(Integer ttype, Token token, String name, java.util.List<expr> bases,
+     java.util.List<stmt> body, java.util.List<expr> decorator_list) {
+         super(ttype, token);
+Index: src/org/python/antlr/ast/alias.java
+===================================================================
+--- src/org/python/antlr/ast/alias.java	(revision 6959)
++++ src/org/python/antlr/ast/alias.java	(working copy)
+@@ -42,6 +42,10 @@
+         this.name = AstAdapters.py2identifier(name);
+     }
+ 
++    private java.util.List<Name> nameNodes;
++    public java.util.List<Name> getInternalNameNodes() {
++        return nameNodes;
++    }
+     private String asname;
+     public String getInternalAsname() {
+         return asname;
+@@ -56,6 +60,10 @@
+         this.asname = AstAdapters.py2identifier(asname);
+     }
+ 
++    private Name asnameNode;
++    public Name getInternalAsnameNode() {
++        return asnameNode;
++    }
+ 
+     private final static PyString[] fields =
+     new PyString[] {new PyString("name"), new PyString("asname")};
+@@ -92,6 +100,21 @@
+         this.asname = asname;
+     }
+ 
++    // [import] name [as asname]
++    public alias(Name name, Name asname) {
++        this(java.util.Arrays.asList(new Name[]{name}), asname);
++    }
++
++    // [import] ...foo.bar.baz [as asname]
++    public alias(java.util.List<Name> nameNodes, Name asname) {
++        this.nameNodes = nameNodes;
++        this.name = dottedNameListToString(nameNodes);
++        if (asname != null) {
++            this.asnameNode = asname;
++            this.asname = asname.getInternalId();
++        }
++    }
++
+     public alias(Integer ttype, Token token, String name, String asname) {
+         super(ttype, token);
+         this.name = name;
+Index: src/org/python/antlr/ast/ImportFrom.java
+===================================================================
+--- src/org/python/antlr/ast/ImportFrom.java	(revision 6959)
++++ src/org/python/antlr/ast/ImportFrom.java	(working copy)
+@@ -1,4 +1,4 @@
+-// Autogenerated AST node
++// Autogenerated AST node   -*- c-basic-offset:4 -*-
+ package org.python.antlr.ast;
+ import org.antlr.runtime.CommonToken;
+ import org.antlr.runtime.Token;
+@@ -24,6 +24,7 @@
+ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.List;
+ 
+ @ExposedType(name = "_ast.ImportFrom", base = AST.class)
+ public class ImportFrom extends stmt {
+@@ -42,8 +43,8 @@
+         this.module = AstAdapters.py2identifier(module);
+     }
+ 
+-    private java.util.List<alias> names;
+-    public java.util.List<alias> getInternalNames() {
++    private List<alias> names;
++    public List<alias> getInternalNames() {
+         return names;
+     }
+     @ExposedGet(name = "names")
+@@ -55,6 +56,11 @@
+         this.names = AstAdapters.py2aliasList(names);
+     }
+ 
++    private List<Name> moduleNames;
++    public List<Name> getInternalModuleNames() {
++        return moduleNames;
++    }
++
+     private Integer level;
+     public Integer getInternalLevel() {
+         return level;
+@@ -111,8 +117,10 @@
+         setLevel(level);
+     }
+ 
+-    public ImportFrom(Token token, String module, java.util.List<alias> names, Integer level) {
+-        super(token);
++    public ImportFrom(int ttype, Token token,
++                      String module, List<Name> moduleNames,
++                      List<alias> names, Integer level) {
++        super(ttype, token);
+         this.module = module;
+         this.names = names;
+         if (names == null) {
+@@ -121,10 +129,17 @@
+         for(PythonTree t : this.names) {
+             addChild(t);
+         }
++        this.moduleNames = moduleNames;
++        if (moduleNames == null) {
++            this.moduleNames = new ArrayList<Name>();
++        }
++        for(PythonTree t : this.moduleNames) {
++            addChild(t);
++        }
+         this.level = level;
+     }
+ 
+-    public ImportFrom(Integer ttype, Token token, String module, java.util.List<alias> names,
++    public ImportFrom(Integer ttype, Token token, String module, List<alias> names,
+     Integer level) {
+         super(ttype, token);
+         this.module = module;
+@@ -138,7 +153,7 @@
+         this.level = level;
+     }
+ 
+-    public ImportFrom(PythonTree tree, String module, java.util.List<alias> names, Integer level) {
++    public ImportFrom(PythonTree tree, String module, List<alias> names, Integer level) {
+         super(tree);
+         this.module = module;
+         this.names = names;
+Index: src/org/python/antlr/ast/FunctionDef.java
+===================================================================
+--- src/org/python/antlr/ast/FunctionDef.java	(revision 6959)
++++ src/org/python/antlr/ast/FunctionDef.java	(working copy)
+@@ -32,6 +32,10 @@
+     public String getInternalName() {
+         return name;
+     }
++    private Name nameNode;
++    public Name getInternalNameNode() {
++        return nameNode;
++    }
+     @ExposedGet(name = "name")
+     public PyObject getName() {
+         if (name == null) return Py.None;
+@@ -148,6 +152,28 @@
+         }
+     }
+ 
++    public FunctionDef(Token token, Name name, arguments args, java.util.List<stmt> body,
++            java.util.List<expr> decorator_list) {
++        super(token);
++        this.name = name.getText();
++        this.nameNode = name;
++        this.args = args;
++        this.body = body;
++        if (body == null) {
++            this.body = new ArrayList<stmt>();
++        }
++        for(PythonTree t : this.body) {
++            addChild(t);
++        }
++        this.decorator_list = decorator_list;
++        if (decorator_list == null) {
++            this.decorator_list = new ArrayList<expr>();
++        }
++        for(PythonTree t : this.decorator_list) {
++            addChild(t);
++        }
++    }
++
+     public FunctionDef(Integer ttype, Token token, String name, arguments args,
+     java.util.List<stmt> body, java.util.List<expr> decorator_list) {
+         super(ttype, token);
+Index: src/org/python/antlr/ast/Name.java
+===================================================================
+--- src/org/python/antlr/ast/Name.java	(revision 6959)
++++ src/org/python/antlr/ast/Name.java	(working copy)
+@@ -1,4 +1,4 @@
+-// Autogenerated AST node
++// Autogenerated AST node  -*- c-basic-offset:4 -*-
+ package org.python.antlr.ast;
+ import org.antlr.runtime.CommonToken;
+ import org.antlr.runtime.Token;
+@@ -55,7 +55,6 @@
+         this.ctx = AstAdapters.py2expr_context(ctx);
+     }
+ 
+-
+     private final static PyString[] fields =
+     new PyString[] {new PyString("id"), new PyString("ctx")};
+     @ExposedGet(name = "_fields")
+Index: src/org/python/antlr/BaseParser.java
+===================================================================
+--- src/org/python/antlr/BaseParser.java	(revision 6959)
++++ src/org/python/antlr/BaseParser.java	(working copy)
+@@ -31,7 +31,7 @@
+         this.errorHandler = eh;
+     }
+ 
+-    private PythonParser setupParser(boolean single) {
++    protected PythonParser setupParser(boolean single) {
+         PythonLexer lexer = new PythonLexer(charStream);
+         lexer.setErrorHandler(errorHandler);
+         lexer.single = single;
+Index: build.xml
+===================================================================
+--- build.xml	(revision 6959)
++++ build.xml	(working copy)
+@@ -184,6 +184,7 @@
+             <pathelement path="${extlibs.dir}/postgresql-8.3-603.jdbc4.jar" />
+             <pathelement path="${extlibs.dir}/antlr-2.7.7.jar" />
+             <pathelement path="${extlibs.dir}/antlr-3.1.3.jar" />
++            <pathelement path="${extlibs.dir}/antlr-runtime-3.1.3.jar" />
+             <pathelement path="${extlibs.dir}/stringtemplate-3.2.jar" />
+             <pathelement path="${extlibs.dir}/livetribe-jsr223-2.0.5.jar" />
+ 
+@@ -887,6 +888,7 @@
+         <junit fork="true" printsummary="true">
+             <formatter type="xml"/>
+             <sysproperty key="python.home" value="${dist.dir}"/>
++            <sysproperty key="python.test.source.dir" value="${test.source.dir}"/>
+             <classpath refid="test.classpath"/>
+             <batchtest todir="${junit.reports}">
+                 <fileset dir="${test.source.dir}" includes="**/*Test*.java">
+@@ -897,6 +899,50 @@
+             </batchtest>
+         </junit>
+     </target>
++    <target name="idxtest" depends="developer-build">
++        <mkdir dir="${junit.reports}"/>
++        <junit fork="true" printsummary="true" showoutput="true">
++            <formatter type="xml"/>
++            <sysproperty key="python.home" value="${dist.dir}"/>
++            <sysproperty key="python.test.source.dir" value="${test.source.dir}"/>
++            <classpath refid="test.classpath"/>
++            <batchtest todir="${junit.reports}">
++                <fileset dir="${test.source.dir}" includes="**/*Test*.java">
++                    <exclude name="javatests/**/*" />
++                    <exclude name="**/InterpTestCase.java" />
++                    <exclude name="org/python/antlr/**" />
++                    <exclude name="org/python/core/**" />
++                    <exclude name="org/python/expose/**" />
++                    <exclude name="org/python/jsr223/**" />
++                    <exclude name="org/python/tests/**" />
++                    <exclude name="org/python/util/**" />
++                </fileset>
++            </batchtest>
++        </junit>
++    </target>
++    <!-- XXX: how do I share common stuff with "idxtest" target? -->
++    <target name="idxtest-debug" depends="developer-build">
++        <mkdir dir="${junit.reports}"/>
++        <junit fork="true" printsummary="true">
++            <formatter type="xml"/>
++            <sysproperty key="python.home" value="${dist.dir}"/>
++            <sysproperty key="python.test.source.dir" value="${test.source.dir}"/>
++            <classpath refid="test.classpath"/>
++            <jvmarg value="-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5000"/>
++            <batchtest todir="${junit.reports}">
++                <fileset dir="${test.source.dir}" includes="**/*Test*.java">
++                    <exclude name="javatests/**/*" />
++                    <exclude name="**/InterpTestCase.java" />
++                    <exclude name="org/python/antlr/**" />
++                    <exclude name="org/python/core/**" />
++                    <exclude name="org/python/expose/**" />
++                    <exclude name="org/python/jsr223/**" />
++                    <exclude name="org/python/tests/**" />
++                    <exclude name="org/python/util/**" />
++                </fileset>
++            </batchtest>
++        </junit>
++    </target>
+     <target name="modjytest" depends="developer-build">
+         <ant dir="tests/modjy">
+             <property name="jython_home" value="${dist.dir}"/>
+Index: .classpath
+===================================================================
+--- .classpath	(revision 6959)
++++ .classpath	(working copy)
+@@ -12,7 +12,6 @@
+ 	<classpathentry kind="lib" path="extlibs/mysql-connector-java-5.1.6.jar"/>
+ 	<classpathentry kind="lib" path="extlibs/postgresql-8.3-603.jdbc4.jar"/>
+ 	<classpathentry kind="lib" path="extlibs/servlet-api-2.5.jar"/>
+-	<classpathentry kind="var" path="ANT_HOME/lib/ant.jar"/>
+ 	<classpathentry kind="lib" path="extlibs/antlr-runtime-3.1.3.jar"/>
+ 	<classpathentry kind="lib" path="extlibs/asm-3.1.jar"/>
+ 	<classpathentry kind="lib" path="extlibs/asm-commons-3.1.jar"/>
